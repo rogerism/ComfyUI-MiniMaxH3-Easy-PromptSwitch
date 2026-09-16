@@ -22,6 +22,13 @@ const LINKS_PROP = "minimax_h3_virtual_media_links";
 const PROMPT_DOC_PROP = "minimax_h3_prompt_reference_doc";
 const PROMPT_VIEW_PROP = "minimax_h3_prompt_view_mode";
 const PROMPT_AUTO_MARKER_PROP = "minimax_h3_auto_prompt_marker";
+const PROMPT_SLOTS_PROP = "minimax_h3_prompt_slots";
+const PROMPT_ACTIVE_SLOT_PROP = "minimax_h3_prompt_active_slot";
+const PROMPT_SOURCE_PROP = "minimax_h3_prompt_active_source";
+const PROMPT_OPTIMIZED_DOC_PROP = "minimax_h3_prompt_optimized_doc";
+const PROMPT_SOURCE_ORIGINAL = "original";
+const PROMPT_SOURCE_OPTIMIZED = "optimized";
+const MAX_PROMPT_SLOTS = 8;
 const PROMPT_OPTIMIZER_SETTINGS_ENDPOINT = "/minimax_h3_easy/prompt_optimizer_settings";
 const PROMPT_OPTIMIZER_SETTINGS_DEFAULTS = Object.freeze({
     api_format: "openai",
@@ -131,7 +138,16 @@ const TEXT = {
     rawPromptPlaceholder: ZH_BROWSER ? "\u539f\u59cb\u63d0\u793a\u8bcd..." : "Raw prompt...",
     showRawPrompt: ZH_BROWSER ? "\u663e\u793a\u539f\u59cb\u63d0\u793a\u8bcd" : "Show raw prompt",
     showStructuredPrompt: ZH_BROWSER ? "\u8fd4\u56de\u7ed3\u6784\u5316\u7f16\u8f91" : "Back to structured editor",
-    optimizePrompt: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u4f18\u5316" : "Prompt optimization",
+    optimizePrompt: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u4f18\u5316\uff08\u57fa\u4e8e\u539f\u6587\u91cd\u65b0\u4f18\u5316\uff0c\u4f1a\u8986\u76d6\u5f53\u524d\u4f18\u5316\u7ed3\u679c\uff09" : "Optimize prompt (re-optimizes from the original text and overwrites the current optimized result)",
+    promptSourceOriginal: ZH_BROWSER ? "\u539f\u6587" : "Original",
+    promptSourceOptimized: ZH_BROWSER ? "\u4f18\u5316\u540e" : "Optimized",
+    promptSourceEmptyHint: ZH_BROWSER ? "\u5c1a\u65e0\u4f18\u5316\u7ed3\u679c\uff0c\u53ef\u70b9\u201c\u2726\u201d\u751f\u6210\u6216\u76f4\u63a5\u5728\u201c\u4f18\u5316\u540e\u201d\u4e2d\u7f16\u5199" : "No optimized result yet. Click \u2726 to generate, or type directly here.",
+    slotAdd: ZH_BROWSER ? "\u65b0\u589e\u63d0\u793a\u8bcd\u69fd\u4f4d\uff08\u590d\u5236\u5f53\u524d\u5185\u5bb9\uff09" : "Add prompt slot (copies current content)",
+    slotAddFull: ZH_BROWSER ? "\u69fd\u4f4d\u5df2\u8fbe\u4e0a\u9650" : "Slot limit reached",
+    slotRemove: ZH_BROWSER ? "\u5220\u9664\u6b64\u69fd\u4f4d" : "Remove this slot",
+    slotRemoveLast: ZH_BROWSER ? "\u81f3\u5c11\u4fdd\u7559\u4e00\u4e2a\u69fd\u4f4d" : "At least one slot is required",
+    slotRenameHint: ZH_BROWSER ? "\u70b9\u51fb\u7f16\u8f91\u69fd\u4f4d\u540d\u79f0" : "Click to edit slot name",
+    slotDefaultName: ZH_BROWSER ? "\u69fd" : "Slot",
     regeneratePrompt: ZH_BROWSER ? "\u91cd\u65b0\u751f\u6210" : "Regenerate",
     optimizerSettings: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u4f18\u5316\u8bbe\u7f6e" : "Prompt optimization settings",
     settingsOpen: ZH_BROWSER ? "\u6253\u5f00\u63d0\u793a\u8bcd\u4f18\u5316 API \u8bbe\u7f6e" : "Open prompt optimization API settings",
@@ -2620,7 +2636,7 @@ function promptInputIsConnected(node) {
 function buildRuntimePrompt(node, runtimeLinks) {
     const promptWidget = getWidget(node, "prompt");
     const fallback = String(promptWidget?.value || "");
-    const doc = node?.properties?.[PROMPT_DOC_PROP];
+    const doc = activePromptDoc(node);
     if (!Array.isArray(doc?.parts)) return fallback;
     return doc.parts.map((part) => {
         if (part?.type === "dialogue") return `<d>${String(part.text || "")}</d>`;
@@ -3579,10 +3595,175 @@ function appendRawPromptText(container, value) {
     appendTextWithBreaks(container, String(value || ""));
 }
 
+function promptSlots(node) {
+    const properties = node?.properties;
+    if (!properties) return null;
+    let slots = properties[PROMPT_SLOTS_PROP];
+    if (!Array.isArray(slots) || !slots.length) {
+        slots = [{ id: 1, name: "", original: null, optimized: null }];
+        properties[PROMPT_SLOTS_PROP] = slots;
+        properties[PROMPT_ACTIVE_SLOT_PROP] = 1;
+    }
+    return slots;
+}
+
+function activeSlotId(node) {
+    const slots = promptSlots(node);
+    if (!slots) return 1;
+    const stored = Number(node.properties[PROMPT_ACTIVE_SLOT_PROP]);
+    const found = slots.find((slot) => Number(slot?.id) === stored);
+    return found ? Number(found.id) : Number(slots[0].id);
+}
+
+function activeSlot(node) {
+    const slots = promptSlots(node);
+    if (!slots) return null;
+    const id = activeSlotId(node);
+    return slots.find((slot) => Number(slot?.id) === id) || slots[0];
+}
+
+function promptSourceMode(node) {
+    return String(node?.properties?.[PROMPT_SOURCE_PROP] || PROMPT_SOURCE_ORIGINAL) === PROMPT_SOURCE_OPTIMIZED
+        ? PROMPT_SOURCE_OPTIMIZED
+        : PROMPT_SOURCE_ORIGINAL;
+}
+
+function setPromptSourceMode(node, source) {
+    if (!node) return;
+    node.properties ||= {};
+    node.properties[PROMPT_SOURCE_PROP] = source === PROMPT_SOURCE_OPTIMIZED ? PROMPT_SOURCE_OPTIMIZED : PROMPT_SOURCE_ORIGINAL;
+}
+
+function setActiveSlotId(node, id) {
+    const slots = promptSlots(node);
+    if (!slots) return;
+    node.properties ||= {};
+    node.properties[PROMPT_ACTIVE_SLOT_PROP] = slots.some((slot) => Number(slot?.id) === Number(id)) ? Number(id) : Number(slots[0].id);
+}
+
+function getSlotDoc(slot, source) {
+    if (!slot) return null;
+    return source === PROMPT_SOURCE_OPTIMIZED ? slot.optimized : slot.original;
+}
+
+function setSlotDoc(slot, source, doc) {
+    if (!slot) return;
+    if (source === PROMPT_SOURCE_OPTIMIZED) slot.optimized = doc;
+    else slot.original = doc;
+}
+
+function docHasContent(doc) {
+    return Boolean(doc && (String(doc.text || "").trim() || (Array.isArray(doc.parts) && doc.parts.length)));
+}
+
+function slotDocHasContent(slot, source) {
+    return docHasContent(getSlotDoc(slot, source));
+}
+
+function activePromptDoc(node) {
+    const slot = activeSlot(node);
+    if (!slot) return null;
+    return getSlotDoc(slot, promptSourceMode(node));
+}
+
+function activePromptDocHasParts(node) {
+    const slot = activeSlot(node);
+    if (!slot) return false;
+    const doc = getSlotDoc(slot, promptSourceMode(node));
+    return Array.isArray(doc?.parts);
+}
+
+// 编辑器此刻显示的是"回退内容"（当前容器为空，显示的是别处内容）还是自己的内容。
+// 回退态下 blur/其他过路 sync 绝不能落盘，否则会把别槽内容写进空容器（槽内容互相污染的根因）。
+// 用户真正键入后立即解除回退态。
+function isEditorShowingFallback(node) {
+    return Boolean(node?.__h3EditorFallback);
+}
+
+function clearEditorFallbackFlag(node) {
+    if (node?.__h3EditorFallback) node.__h3EditorFallback = false;
+}
+
+function storeActivePromptDoc(node, doc) {
+    const slot = activeSlot(node);
+    if (slot) setSlotDoc(slot, promptSourceMode(node), doc);
+    if (promptSourceMode(node) === PROMPT_SOURCE_ORIGINAL) {
+        node.properties ||= {};
+        node.properties[PROMPT_DOC_PROP] = doc;
+    }
+}
+
+function syncPromptWidgetFallback(node) {
+    const widget = getWidget(node, "prompt");
+    if (!widget) return;
+    const slot = activeSlot(node);
+    const source = promptSourceMode(node);
+    const doc = getSlotDoc(slot, source);
+    let text = "";
+    let fallback = false;
+    if (doc && String(doc.text || "").length) {
+        text = Array.isArray(doc.parts) ? promptDocTextFromParts(doc.parts) : String(doc.text || "");
+    } else if (source === PROMPT_SOURCE_OPTIMIZED) {
+        const originalDoc = slot?.original;
+        if (originalDoc) {
+            text = Array.isArray(originalDoc.parts) ? promptDocTextFromParts(originalDoc.parts) : String(originalDoc.text || "");
+            fallback = true;
+        } else {
+            fallback = true;
+        }
+    } else {
+        fallback = true;
+    }
+    widget.value = text;
+    if (widget._state) widget._state.value = text;
+    node.__h3EditorFallback = fallback;
+}
+
+function migrateLegacyPromptSlots(node) {
+    const properties = node?.properties;
+    if (!properties) return;
+    // slots 已存在 = 新版数据，镜像只是给旧版工具看的兼容投影，绝不能反向灌回（否则陈旧镜像污染空槽）。
+    if (Array.isArray(properties[PROMPT_SLOTS_PROP]) && properties[PROMPT_SLOTS_PROP].length) {
+        syncLegacyPromptMirror(node);
+        return;
+    }
+    const slots = promptSlots(node);
+    if (!slots) return;
+    const first = slots[0];
+    let migrated = false;
+    if (properties[PROMPT_DOC_PROP] && !first.original) {
+        first.original = clonePromptDoc(properties[PROMPT_DOC_PROP]);
+        migrated = true;
+    }
+    if (properties[PROMPT_OPTIMIZED_DOC_PROP] && !first.optimized) {
+        first.optimized = clonePromptDoc(properties[PROMPT_OPTIMIZED_DOC_PROP]);
+        migrated = true;
+    }
+    if (!first.original && properties[PROMPT_DOC_PROP]) {
+        first.original = clonePromptDoc(properties[PROMPT_DOC_PROP]);
+        migrated = true;
+    }
+    if (migrated) {
+        if (!properties[PROMPT_SOURCE_PROP]) {
+            properties[PROMPT_SOURCE_PROP] = first.optimized ? PROMPT_SOURCE_OPTIMIZED : PROMPT_SOURCE_ORIGINAL;
+        }
+        syncLegacyPromptMirror(node);
+    }
+}
+
+function syncLegacyPromptMirror(node) {
+    const properties = node?.properties;
+    const slot = activeSlot(node);
+    if (!properties || !slot) return;
+    // 无条件镜像：激活槽原文为空也要写入空 doc，否则残留上一激活槽的陈旧镜像，
+    // 保存后重新加载时 migrateLegacyPromptSlots 会把陈旧内容灌进空槽（删激活槽内容串进槽 1 的根因）。
+    properties[PROMPT_DOC_PROP] = slot.original ? clonePromptDoc(slot.original) : { version: 1, text: "", parts: [] };
+}
+
 function serializeEditorDoc(editor) {
     const node = editorPromptNode(editor);
     if (isRawPromptMode(node)) {
-        const current = node?.properties?.[PROMPT_DOC_PROP];
+        const current = activePromptDoc(node);
         if (!node?.__h3RawPromptNeedsSync && current) return clonePromptDoc(current);
         return serializeRawPromptDoc(node, editor);
     }
@@ -3648,7 +3829,7 @@ function renderEditorFromNode(node, force = false) {
     const editor = node?.__h3Editor;
     const widget = getWidget(node, "prompt");
     if (!editor || !widget || (document.activeElement === editor && !force)) return;
-    const doc = node.properties?.[PROMPT_DOC_PROP];
+    const doc = activePromptDoc(node);
     editor.textContent = "";
     const raw = isRawPromptMode(node);
     editor.classList.toggle("is-raw", raw);
@@ -3702,13 +3883,14 @@ function syncPromptFromEditor(node, markDirty = true) {
     const editor = node?.__h3Editor;
     const widget = getWidget(node, "prompt");
     if (!editor || !widget || node.__h3EditorSyncing) return;
+    // 回退显示态（当前容器为空、屏幕上是别处内容）禁止落盘，防跨容器污染。
+    if (isEditorShowingFallback(node)) return;
     node.__h3EditorSyncing = true;
     try {
         const doc = serializeEditorDoc(editor);
         widget.value = doc.text;
         if (widget._state) widget._state.value = doc.text;
-        node.properties ||= {};
-        node.properties[PROMPT_DOC_PROP] = doc;
+        storeActivePromptDoc(node, doc);
         syncModeWidgets(node);
         if (isRawPromptMode(node)) node.__h3RawPromptNeedsSync = false;
         syncSegmentSummary(node);
@@ -3807,8 +3989,7 @@ function applyPromptHistoryEntry(node, entry) {
     history.applying = true;
     try {
         const doc = clonePromptDoc(entry.doc);
-        node.properties ||= {};
-        node.properties[PROMPT_DOC_PROP] = doc;
+        storeActivePromptDoc(node, doc);
         widget.value = doc.text;
         if (widget._state) widget._state.value = doc.text;
         renderEditorFromNode(node, true);
@@ -4646,7 +4827,7 @@ function syncSegmentSummary(node) {
 }
 
 function promptTextForOptimizer(node) {
-    const doc = node?.properties?.[PROMPT_DOC_PROP];
+    const doc = activePromptDoc(node);
     if (Array.isArray(doc?.parts)) {
         return promptDocTextFromParts(doc.parts);
     }
@@ -4797,6 +4978,282 @@ function repairNodeLayout(node) {
     };
     if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
     else setTimeout(run, 0);
+}
+
+function togglePromptSource(node, next) {
+    if (!node?.__h3Editor) return;
+    const source = next === PROMPT_SOURCE_OPTIMIZED ? PROMPT_SOURCE_OPTIMIZED : PROMPT_SOURCE_ORIGINAL;
+    if (promptSourceMode(node) === source) return;
+    // 只在当前容器已有内容（编辑器显示的是它自己）时落盘；空容器回退显示的是别的内容，落盘会污染它。
+    if (activePromptDocHasParts(node)) syncPromptFromEditor(node, false);
+    setPromptSourceMode(node, source);
+    syncPromptWidgetFallback(node);
+    renderEditorFromNode(node, true);
+    syncEditorMode(node);
+    resetPromptHistory(node);
+    syncPromptSourceButton(node);
+    syncSlotNameButton(node);
+    const editor = node.__h3Editor;
+    editor.focus({ preventScroll: true });
+    setEditorCaretAtEnd(editor);
+    node.setDirtyCanvas?.(true, true);
+    app.graph?.setDirtyCanvas?.(true, true);
+}
+
+function togglePromptSlot(node, nextId) {
+    if (!node?.__h3Editor) return;
+    const targetId = Number(nextId);
+    if (!Number.isFinite(targetId) || targetId === Number(activeSlotId(node))) return;
+    if (activePromptDocHasParts(node)) syncPromptFromEditor(node, false);
+    setActiveSlotId(node, targetId);
+    syncPromptWidgetFallback(node);
+    renderEditorFromNode(node, true);
+    syncEditorMode(node);
+    resetPromptHistory(node);
+    syncPromptSourceButton(node);
+    syncSlotNameButton(node);
+    const editor = node.__h3Editor;
+    editor.focus({ preventScroll: true });
+    setEditorCaretAtEnd(editor);
+    node.setDirtyCanvas?.(true, true);
+    app.graph?.setDirtyCanvas?.(true, true);
+}
+
+function addPromptSlot(node) {
+    const slots = promptSlots(node);
+    if (!node?.__h3Editor || !slots || slots.length >= MAX_PROMPT_SLOTS) return;
+    if (activePromptDocHasParts(node)) syncPromptFromEditor(node, false);
+    const current = activeSlot(node);
+    const maxId = slots.reduce((max, slot) => Math.max(max, Number(slot?.id) || 0), 0);
+    const slot = {
+        id: maxId + 1,
+        name: "",
+        original: current?.original ? clonePromptDoc(current.original) : null,
+        optimized: current?.optimized ? clonePromptDoc(current.optimized) : null,
+    };
+    slots.push(slot);
+    setActiveSlotId(node, slot.id);
+    syncPromptWidgetFallback(node);
+    renderEditorFromNode(node, true);
+    syncEditorMode(node);
+    resetPromptHistory(node);
+    syncPromptSourceButton(node);
+    syncSlotNameButton(node);
+    node.setDirtyCanvas?.(true, true);
+    app.graph?.setDirtyCanvas?.(true, true);
+    app.graph?.change?.();
+}
+
+function removePromptSlot(node, slotId) {
+    const slots = promptSlots(node);
+    if (!slots || slots.length <= 1) return;
+    const index = slots.findIndex((slot) => Number(slot?.id) === Number(slotId));
+    if (index < 0) return;
+    const target = slots[index];
+    // 非空槽（原文或优化后任一有内容）删除前二次确认，防误删丢文本。
+    if (slotDocHasContent(target, PROMPT_SOURCE_ORIGINAL) || slotDocHasContent(target, PROMPT_SOURCE_OPTIMIZED)) {
+        const name = String(target?.name || "").trim() || `${TEXT.slotDefaultName}${index + 1}`;
+        const message = ZH_BROWSER
+            ? `删除槽位「${name}」？其中保存的提示词内容将一并删除，且无法恢复。`
+            : `Remove slot "${name}"? Its saved prompt content will be deleted and cannot be recovered.`;
+        if (!globalThis.confirm?.(message)) return;
+    }
+    // 必须先判定"删的是不是激活槽"再 splice：splice 后被删 id 已不存在，
+    // activeSlotId 会兜底成槽 1，导致激活判断失效（指针漂移 → 槽 1 被覆盖的根因）。
+    const isActive = Number(activeSlotId(node)) === Number(slotId);
+    slots.splice(index, 1);
+    if (isActive) {
+        const next = slots[Math.max(0, index - 1)] || slots[0];
+        setActiveSlotId(node, Number(next.id));
+        syncPromptWidgetFallback(node);
+        renderEditorFromNode(node, true);
+        syncEditorMode(node);
+        resetPromptHistory(node);
+    }
+    syncPromptSourceButton(node);
+    syncSlotNameButton(node);
+    node.setDirtyCanvas?.(true, true);
+    app.graph?.setDirtyCanvas?.(true, true);
+    app.graph?.change?.();
+}
+
+function slotDisplayName(node, slot) {
+    const slots = promptSlots(node) || [];
+    const index = slots.findIndex((item) => item === slot);
+    const name = String(slot?.name || "").trim();
+    if (name) return name;
+    return `${TEXT.slotDefaultName}${index >= 0 ? index + 1 : 1}`;
+}
+
+function syncSlotNameButton(node) {
+    const nameGroup = node?.__h3PromptSlotNameGroup;
+    const slot = activeSlot(node);
+    if (!nameGroup || !slot || nameGroup.classList.contains("is-editing")) return;
+    nameGroup.textContent = "";
+    const label = document.createElement("span");
+    label.className = "h3-prompt-slot-name-label";
+    label.textContent = slotDisplayName(node, slot);
+    nameGroup.append(label);
+    nameGroup.title = TEXT.slotRenameHint;
+}
+
+function commitSlotName(node, value) {
+    const slot = activeSlot(node);
+    if (slot) slot.name = String(value || "").trim().slice(0, 40);
+    syncSlotNameButton(node);
+    syncPromptSourceButton(node);
+    app.graph?.change?.();
+}
+
+function beginSlotNameEdit(node) {
+    const nameGroup = node?.__h3PromptSlotNameGroup;
+    const slot = activeSlot(node);
+    if (!nameGroup || !slot || nameGroup.classList.contains("is-editing")) return;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "h3-prompt-slot-name-input";
+    input.value = String(slot.name || "");
+    input.placeholder = slotDisplayName(node, slot);
+    input.maxLength = 40;
+    nameGroup.textContent = "";
+    nameGroup.classList.add("is-editing");
+    nameGroup.append(input);
+    input.addEventListener("pointerdown", (event) => event.stopPropagation());
+    input.addEventListener("click", (event) => event.stopPropagation());
+    input.addEventListener("keydown", (event) => {
+        event.stopPropagation();
+        if (event.key === "Enter") {
+            event.preventDefault();
+            input.blur();
+        } else if (event.key === "Escape") {
+            event.preventDefault();
+            input.value = String(slot.name || "");
+            input.blur();
+        }
+    });
+    input.addEventListener("blur", () => {
+        nameGroup.classList.remove("is-editing");
+        commitSlotName(node, input.value);
+    });
+    requestAnimationFrame(() => {
+        input.focus();
+        input.select();
+    });
+}
+
+function syncPromptSourceButton(node) {
+    const slotGroup = node?.__h3PromptSlotSwitch;
+    const sourceGroup = node?.__h3PromptSourceSwitch;
+    if (!slotGroup || !sourceGroup) return;
+    const slots = promptSlots(node) || [];
+    const activeId = activeSlotId(node);
+    const source = promptSourceMode(node);
+    slotGroup.textContent = "";
+    const activeSlotData = slots.find((slot) => Number(slot?.id) === activeId) || null;
+    if (activeSlotData) {
+        const nameGroup = document.createElement("button");
+        nameGroup.type = "button";
+        nameGroup.className = "h3-prompt-slot-name";
+        const activeName = String(activeSlotData.name || "").trim();
+        nameGroup.textContent = activeName || `${TEXT.slotDefaultName}${slots.indexOf(activeSlotData) + 1}`;
+        nameGroup.title = TEXT.slotRenameHint;
+        node.__h3PromptSlotNameGroup = nameGroup;
+        nameGroup.addEventListener("pointerdown", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+        });
+        nameGroup.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            beginSlotNameEdit(node);
+        });
+        slotGroup.append(nameGroup);
+    }
+    slots.forEach((slot, index) => {
+        const active = Number(slot?.id) === activeId;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "h3-prompt-slot-segment"
+            + (active ? " is-active" : "")
+            + (!slotDocHasContent(slot, source) ? " is-empty" : "");
+        button.dataset.slotId = String(slot?.id ?? "");
+        const name = String(slot?.name || "").trim();
+        button.title = name || `${TEXT.slotDefaultName}${index + 1}`;
+        button.setAttribute("aria-pressed", active ? "true" : "false");
+        const label = document.createElement("span");
+        label.className = "h3-prompt-slot-segment-label";
+        label.textContent = String(index + 1);
+        button.append(label);
+        button.addEventListener("pointerdown", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+        });
+        button.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!active) togglePromptSlot(node, Number(slot?.id));
+        });
+        if (slots.length > 1) {
+            const close = document.createElement("span");
+            close.className = "h3-prompt-slot-close";
+            close.textContent = "\u00d7";
+            close.title = TEXT.slotRemove;
+            close.setAttribute("role", "button");
+            close.setAttribute("aria-label", TEXT.slotRemove);
+            close.addEventListener("pointerdown", (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+            });
+            close.addEventListener("click", (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                removePromptSlot(node, Number(slot?.id));
+            });
+            button.append(close);
+        }
+        slotGroup.append(button);
+    });
+    const canAdd = slots.length < MAX_PROMPT_SLOTS;
+    const addButton = document.createElement("button");
+    addButton.type = "button";
+    addButton.className = "h3-prompt-slot-add" + (canAdd ? "" : " is-full");
+    addButton.textContent = "+";
+    addButton.title = canAdd ? TEXT.slotAdd : TEXT.slotAddFull;
+    addButton.setAttribute("aria-label", addButton.title);
+    addButton.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+    });
+    addButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (canAdd) addPromptSlot(node);
+    });
+    slotGroup.append(addButton);
+
+    sourceGroup.textContent = "";
+    [PROMPT_SOURCE_ORIGINAL, PROMPT_SOURCE_OPTIMIZED].forEach((sourceKey) => {
+        const active = source === sourceKey;
+        const empty = sourceKey === PROMPT_SOURCE_OPTIMIZED && !slotDocHasContent(activeSlot(node), sourceKey);
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "h3-prompt-source-segment"
+            + (active ? " is-active" : "")
+            + (empty ? " is-empty" : "");
+        button.textContent = sourceKey === PROMPT_SOURCE_ORIGINAL ? TEXT.promptSourceOriginal : TEXT.promptSourceOptimized;
+        if (empty) button.title = TEXT.promptSourceEmptyHint;
+        button.setAttribute("aria-pressed", active ? "true" : "false");
+        button.addEventListener("pointerdown", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+        });
+        button.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!active) togglePromptSource(node, sourceKey);
+        });
+        sourceGroup.append(button);
+    });
 }
 
 function syncPromptViewButton(node) {
@@ -5495,21 +5952,34 @@ function clearAutomaticPromptMarker(node) {
     return true;
 }
 
-function setPromptFromOptimizedText(node, value, { preserveAutoMarker = false, notifyGraphChange = true } = {}) {
+function activeSlotOriginalText(node) {
+    const slot = activeSlot(node);
+    const doc = slot?.original;
+    if (doc && (String(doc.text || "").trim() || (Array.isArray(doc.parts) && doc.parts.length))) {
+        return Array.isArray(doc.parts) ? promptDocTextFromParts(doc.parts) : String(doc.text || "");
+    }
+    return String(getWidget(node, "prompt")?.value || "");
+}
+
+function applyOptimizedPrompt(node, value, { notifyGraphChange = true } = {}) {
     const text = String(value || "").replace(/^```(?:text)?\s*/i, "").replace(/\s*```$/, "").trim();
     const doc = { version: 1, text, parts: promptPartsFromText(node, text) };
     const widget = getWidget(node, "prompt");
     node.properties ||= {};
-    if (!preserveAutoMarker) clearAutomaticPromptMarker(node);
-    node.properties[PROMPT_DOC_PROP] = doc;
+    const slot = activeSlot(node);
+    setSlotDoc(slot, PROMPT_SOURCE_OPTIMIZED, doc);
+    setPromptSourceMode(node, PROMPT_SOURCE_OPTIMIZED);
     if (widget) {
         widget.value = doc.text;
         if (widget._state) widget._state.value = doc.text;
     }
     node.__h3RawPromptNeedsSync = false;
+    syncPromptWidgetFallback(node);
     renderEditorFromNode(node, true);
     syncPromptFromEditor(node, false);
+    resetPromptHistory(node);
     pushPromptHistory(node);
+    syncPromptSourceButton(node);
     node.setDirtyCanvas?.(true, true);
     app.graph?.setDirtyCanvas?.(true, true);
     if (notifyGraphChange) app.graph?.change?.();
@@ -5541,11 +6011,9 @@ function applyRuntimePromptOptimization(node, message) {
 
     if (node.__h3Editor) syncPromptFromEditor(node, false);
     pushPromptHistory(node);
-    setPromptFromOptimizedText(node, prompt, { preserveAutoMarker: true, notifyGraphChange: false });
+    applyOptimizedPrompt(node, prompt, { notifyGraphChange: false });
     node.properties ||= {};
     node.properties[PROMPT_AUTO_MARKER_PROP] = marker;
-    node.__h3OptimizerSourcePrompt = null;
-    node.__h3OptimizerLastResult = null;
     node.setDirtyCanvas?.(true, true);
     app.graph?.setDirtyCanvas?.(true, true);
 }
@@ -5566,9 +6034,7 @@ async function optimizePromptFromEditor(node) {
         return;
     }
     const currentPrompt = promptTextForOptimizer(node);
-    const sourcePrompt = node.__h3OptimizerLastResult === currentPrompt && node.__h3OptimizerSourcePrompt != null
-        ? node.__h3OptimizerSourcePrompt
-        : currentPrompt;
+    const sourcePrompt = activeSlotOriginalText(node);
     if (!sourcePrompt.trim()) return;
     const resources = promptOptimizerResources(node);
     const mediaCounts = { image: 0, video: 0, audio: 0 };
@@ -5619,9 +6085,7 @@ async function optimizePromptFromEditor(node) {
             optimizedPrompt = String(data.prompt || "");
         }
         if (node.__h3OptimizerRequestId !== requestId) return;
-        node.__h3OptimizerSourcePrompt = sourcePrompt;
-        node.__h3OptimizerLastResult = optimizedPrompt;
-        setPromptFromOptimizedText(node, node.__h3OptimizerLastResult);
+        applyOptimizedPrompt(node, optimizedPrompt);
         setPromptOptimizerStatus(node, "success");
     } catch (error) {
         if (abortController.signal.aborted || node.__h3OptimizerRequestId !== requestId || error?.name === "AbortError") return;
@@ -6218,6 +6682,14 @@ function ensurePromptEditor(node) {
         cancelPromptOptimization(node);
     });
     optimizerStatus.append(optimizerStatusSpinner, optimizerStatusText, optimizerCancelButton);
+    const slotSwitch = document.createElement("div");
+    slotSwitch.className = "h3-prompt-slot-switch";
+    slotSwitch.setAttribute("role", "group");
+    slotSwitch.setAttribute("aria-label", "Prompt slots");
+    const sourceSwitch = document.createElement("div");
+    sourceSwitch.className = "h3-prompt-source-switch";
+    sourceSwitch.setAttribute("role", "group");
+    sourceSwitch.setAttribute("aria-label", "Prompt source");
     const viewButton = document.createElement("button");
     viewButton.type = "button";
     viewButton.className = "h3-prompt-editor-tool h3-prompt-editor-view-toggle";
@@ -6243,7 +6715,7 @@ function ensurePromptEditor(node) {
         event.stopPropagation();
         optimizePromptFromEditor(node);
     });
-    editorTools.append(optimizeButton, viewButton);
+    editorTools.append(slotSwitch, sourceSwitch, optimizeButton, viewButton);
     editor.addEventListener("beforeinput", (event) => {
         if (isRawPromptMode(node)) {
             node.__h3DialogueHashHandled = false;
@@ -6277,6 +6749,7 @@ function ensurePromptEditor(node) {
     editor.addEventListener("input", (event) => {
         const raw = isRawPromptMode(node);
         if (raw) node.__h3RawPromptNeedsSync = true;
+        clearEditorFallbackFlag(node);
         syncPromptFromEditor(node);
         if (event?.isComposing || event?.inputType === "insertCompositionText" || node.__h3PromptComposing) {
             if (!raw) syncMentionMenuToCaret(node, editor);
@@ -6462,6 +6935,8 @@ function ensurePromptEditor(node) {
     node.__h3Editor = editor;
     node.__h3EditorWrap = wrap;
     node.__h3PromptEditorTools = editorTools;
+    node.__h3PromptSlotSwitch = slotSwitch;
+    node.__h3PromptSourceSwitch = sourceSwitch;
     node.__h3PromptViewButton = viewButton;
     node.__h3PromptOptimizeButton = optimizeButton;
     node.__h3PromptOptimizerStatus = optimizerStatus;
@@ -6469,6 +6944,8 @@ function ensurePromptEditor(node) {
     syncPromptExternalConnectionState(node);
     renderEditorFromNode(node);
     syncPromptOptimizerButton(node);
+    syncPromptSourceButton(node);
+    syncSlotNameButton(node);
     resetPromptHistory(node);
     const domWidget = node.addDOMWidget("h3_prompt_mentions", "h3_prompt_mentions", wrap, {
         getValue: () => String(getWidget(node, "prompt")?.value || ""),
@@ -6493,6 +6970,9 @@ function ensurePromptEditor(node) {
         node.__h3Editor = null;
         node.__h3EditorWrap = null;
         node.__h3PromptEditorTools = null;
+        node.__h3PromptSlotSwitch = null;
+        node.__h3PromptSourceSwitch = null;
+        node.__h3PromptSlotNameGroup = null;
         node.__h3PromptViewButton = null;
         node.__h3PromptOptimizeButton = null;
         return;
@@ -7193,6 +7673,23 @@ function installNode(nodeType, nodeData) {
             this.properties ||= {};
             this.properties[PROMPT_AUTO_MARKER_PROP] = info.properties[PROMPT_AUTO_MARKER_PROP];
         }
+        if (info?.properties?.[PROMPT_SLOTS_PROP]) {
+            this.properties ||= {};
+            this.properties[PROMPT_SLOTS_PROP] = info.properties[PROMPT_SLOTS_PROP];
+        }
+        if (info?.properties?.[PROMPT_ACTIVE_SLOT_PROP] != null) {
+            this.properties ||= {};
+            this.properties[PROMPT_ACTIVE_SLOT_PROP] = info.properties[PROMPT_ACTIVE_SLOT_PROP];
+        }
+        if (info?.properties?.[PROMPT_SOURCE_PROP]) {
+            this.properties ||= {};
+            this.properties[PROMPT_SOURCE_PROP] = info.properties[PROMPT_SOURCE_PROP];
+        }
+        if (info?.properties?.[PROMPT_OPTIMIZED_DOC_PROP]) {
+            this.properties ||= {};
+            this.properties[PROMPT_OPTIMIZED_DOC_PROP] = info.properties[PROMPT_OPTIMIZED_DOC_PROP];
+        }
+        migrateLegacyPromptSlots(this);
         repairConfiguredWidgetValues(this, info);
         normalizeLinks(this);
         pruneTransportInputsFromNode(this, { force: true });
@@ -7205,6 +7702,8 @@ function installNode(nodeType, nodeData) {
         renderEditorFromNode(this);
         resetPromptHistory(this);
         syncEditorMode(this);
+        syncPromptSourceButton(this);
+        syncSlotNameButton(this);
         requestMentionPreviewRefresh();
         installPromptEditorSoon(this);
         if (this.__h3Editor && restorePromptEditorStableSize(this)) repairNodeLayout(this);
@@ -7237,6 +7736,19 @@ function installNode(nodeType, nodeData) {
     nodeType.prototype.onSerialize = function onSerializeH3Easy(info) {
         if (this.__h3Editor) syncPromptFromEditor(this, false);
         const result = originalSerialize?.apply(this, arguments);
+        syncLegacyPromptMirror(this);
+        if (info && this.properties?.[PROMPT_SLOTS_PROP]) {
+            info.properties ||= {};
+            info.properties[PROMPT_SLOTS_PROP] = this.properties[PROMPT_SLOTS_PROP];
+        }
+        if (info && this.properties?.[PROMPT_ACTIVE_SLOT_PROP] != null) {
+            info.properties ||= {};
+            info.properties[PROMPT_ACTIVE_SLOT_PROP] = this.properties[PROMPT_ACTIVE_SLOT_PROP];
+        }
+        if (info && this.properties?.[PROMPT_SOURCE_PROP]) {
+            info.properties ||= {};
+            info.properties[PROMPT_SOURCE_PROP] = this.properties[PROMPT_SOURCE_PROP];
+        }
         if (info && this.properties?.[PROMPT_DOC_PROP]) {
             info.properties ||= {};
             info.properties[PROMPT_DOC_PROP] = this.properties[PROMPT_DOC_PROP];
@@ -7274,6 +7786,9 @@ function installNode(nodeType, nodeData) {
         this.__h3Editor = null;
         this.__h3EditorWrap = null;
         this.__h3PromptEditorTools = null;
+        this.__h3PromptSlotSwitch = null;
+        this.__h3PromptSourceSwitch = null;
+        this.__h3PromptSlotNameGroup = null;
         this.__h3PromptViewButton = null;
         this.__h3RawPromptNeedsSync = false;
         this.__h3PromptOptimizerStatus = null;
@@ -8546,6 +9061,49 @@ function install() {
       @keyframes h3-prompt-status-spin { to { transform: rotate(360deg); } }
       .h3-prompt-editor-tools {
         position: absolute; right: 14px; bottom: 4px; z-index: 3; display: flex; align-items: center; gap: 3px; pointer-events: auto;
+      }
+      .h3-prompt-slot-switch, .h3-prompt-source-switch {
+        display: inline-flex; align-items: center; padding: 1px; border: 1px solid rgba(255,255,255,.12); border-radius: 5px;
+        background: rgba(14,16,20,.75); box-shadow: 0 1px 3px rgba(0,0,0,.32); user-select: none;
+      }
+      .h3-prompt-slot-segment, .h3-prompt-slot-add, .h3-prompt-source-segment {
+        appearance: none; display: inline-flex; align-items: center; justify-content: center; position: relative;
+        min-width: 15px; height: 15px; padding: 0 4px; margin: 0; border: 1px solid transparent; border-radius: 4px; outline: none;
+        background: transparent; color: rgba(255,255,255,.92); opacity: .5; cursor: pointer; user-select: none;
+        font: 600 8px/1 system-ui, "Segoe UI", sans-serif; letter-spacing: 0;
+        transition: opacity .12s ease, background-color .12s ease, border-color .12s ease;
+      }
+      .h3-prompt-slot-segment:hover, .h3-prompt-slot-add:hover, .h3-prompt-source-segment:hover,
+      .h3-prompt-slot-segment:focus-visible, .h3-prompt-slot-add:focus-visible, .h3-prompt-source-segment:focus-visible { opacity: .78; }
+      .h3-prompt-slot-segment.is-active, .h3-prompt-source-segment.is-active {
+        opacity: 1; background: rgba(0,226,187,.3); border-color: rgba(0,226,187,.3);
+        -webkit-backdrop-filter: blur(1px); backdrop-filter: blur(1px);
+      }
+      .h3-prompt-slot-segment.is-empty:not(.is-active), .h3-prompt-source-segment.is-empty:not(.is-active) { opacity: .4; }
+      .h3-prompt-slot-segment-label { line-height: 1; }
+      .h3-prompt-slot-close {
+        position: absolute; top: -4px; right: -4px; display: none; align-items: center; justify-content: center;
+        width: 9px; height: 9px; border-radius: 50%; background: rgba(90,20,20,.92); color: rgba(255,255,255,.92);
+        font: 600 7px/1 system-ui, "Segoe UI", sans-serif; cursor: pointer; user-select: none;
+      }
+      .h3-prompt-slot-segment:hover .h3-prompt-slot-close { display: inline-flex; }
+      .h3-prompt-slot-add { min-width: 12px; padding: 0 3px; }
+      .h3-prompt-slot-add.is-full { opacity: .22; cursor: not-allowed; }
+      .h3-prompt-slot-name {
+        appearance: none; display: inline-flex; align-items: center; justify-content: center; position: relative;
+        min-width: 24px; max-width: 96px; height: 15px; padding: 0 5px; margin-right: 1px;
+        border: 1px solid rgba(0,226,187,.22); border-radius: 4px; outline: none;
+        background: rgba(0,226,187,.08); color: rgba(255,255,255,.78); opacity: .68; cursor: pointer; user-select: none;
+        font: 600 8px/1 system-ui, "Segoe UI", sans-serif; letter-spacing: 0;
+        transition: opacity .12s ease, border-color .12s ease, color .12s ease;
+      }
+      .h3-prompt-slot-name:hover, .h3-prompt-slot-name:focus-visible { opacity: .9; border-color: rgba(0,226,187,.3); }
+      .h3-prompt-slot-name.is-editing { min-width: 60px; }
+      .h3-prompt-slot-name-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1; }
+      .h3-prompt-slot-name-input {
+        width: 70px; height: 13px; padding: 0 2px; border: 0; border-radius: 3px; outline: none;
+        background: rgba(255,255,255,.08); color: rgba(255,255,255,.95);
+        font: 600 8px/1 system-ui, "Segoe UI", sans-serif; letter-spacing: 0;
       }
       .h3-prompt-editor-tool {
         appearance: none; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 18px; padding: 0;
