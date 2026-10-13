@@ -4965,11 +4965,6 @@ function syncSegmentSummary(node) {
     const localSecondsSpec = String(getWidgetValue(node, "segment_seconds", "") || "");
     const linkedSeconds = linkedInputValue(node, "segment_seconds");
     const secondsSpec = String(linkedSeconds.found ? linkedSeconds.value ?? "" : localSecondsSpec);
-    const parts = secondsSpec.replace(/\uff0c/g, ",").split(",").map((item) => item.trim()).filter(Boolean);
-    const total = parts.reduce((sum, item) => {
-        const value = Number.parseFloat(item);
-        return Number.isFinite(value) ? sum + value : sum;
-    }, 0);
     const seconds = getWidget(node, "seconds");
     const segmentSecondsInput = node?.inputs?.find((input) => String(input?.name || "") === "segment_seconds");
     const totalSecondsInput = node?.inputs?.find((input) => String(input?.name || "") === "seconds");
@@ -5000,8 +4995,6 @@ function syncSegmentSummary(node) {
         const value = Number.parseFloat(item);
         return Number.isFinite(value) ? sum + value : sum;
     }, 0);
-    const seconds = getWidget(node, "seconds");
-    const totalSecondsInput = node?.inputs?.find((input) => String(input?.name || "") === "seconds");
     if (seconds && total > 0 && canSyncFromLinkedSpec && totalSecondsInput?.link == null) {
         seconds.value = Math.round(total * 1000) / 1000;
         if (seconds._state) seconds._state.value = seconds.value;
