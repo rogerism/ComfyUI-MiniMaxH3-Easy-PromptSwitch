@@ -4870,6 +4870,96 @@ function setConditionalWidgetVisible(node, widget, visible, { adjustHeight = tru
     return true;
 }
 
+// MiniMax H3 durations are quantized on a 24 FPS temporal grid, so an
+// arbitrary "seconds" value is not what the backend actually renders. These
+// helpers mirror nodes.py so the optimizer payloads and the stored widget
+// values describe the real delivery length instead of the raw input.
+const H3_FPS = 24;
+
+function h3FrameLengthFrames(seconds, fps = H3_FPS) {
+    // _frame_length: visible 17k+5 grid (native warm-up of 5 frames).
+    const targetFrames = Math.max(5, Number(seconds) * Number(fps));
+    return Math.max(0, Math.round((targetFrames - 5) / 17)) * 17 + 5;
+}
+
+function h3MotionContextFrameLengthFrames(seconds, fps = H3_FPS) {
+    // _motion_context_output_frame_length for later segments: a plain 17k grid.
+    const targetFrames = Math.max(1, Number(seconds) * Number(fps));
+    return Math.max(17, Math.round(targetFrames / 17) * 17);
+}
+
+function h3SnappedSeconds(seconds, { position = 0 } = {}) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value <= 0) return value;
+    const frames = position > 0
+        ? h3MotionContextFrameLengthFrames(value)
+        : h3FrameLengthFrames(value);
+    return Math.round((frames / H3_FPS) * 1000) / 1000;
+}
+
+function h3SnapSegmentSecondsSpec(spec) {
+    const parts = String(spec || "").replace(/\uff0c/g, ",")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+    if (parts.length < 2) return null;
+    const snapped = parts.map((item, index) => {
+        const value = Number.parseFloat(item);
+        if (!Number.isFinite(value) || value <= 0) return null;
+        return String(h3SnappedSeconds(value, { position: index }));
+    });
+    if (snapped.some((item) => item === null)) return null;
+    const original = parts.join(",");
+    const result = snapped.join(",");
+    return result === original ? null : result;
+}
+
+function h3SecondsWidgetHint(seconds, position = 0) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value <= 0) return null;
+    const frames = position > 0
+        ? h3MotionContextFrameLengthFrames(value)
+        : h3FrameLengthFrames(value);
+    const actual = frames / H3_FPS;
+    return `${frames}\u5e27 \u00b7 ${actual.toFixed(3)}s`;
+}
+
+function syncSecondsWidgetLabel(node) {
+    const seconds = getWidget(node, "seconds");
+    if (!seconds) return;
+    const value = Number(seconds.value);
+    if (!Number.isFinite(value) || value <= 0) return;
+    // The seconds row is only an input on non-segment nodes; segment nodes
+    // derive it from segment_seconds, which syncSegmentSummary labels.
+    if (isSegmentMode(node)) return;
+    const hint = h3SecondsWidgetHint(value, 0);
+    if (hint) seconds.label = `${TEXT.seconds}（${hint}）`;
+}
+
+function snapSecondsWidgetsOnConfigure(node) {
+    if (!isTarget(node)) return;
+    const seconds = getWidget(node, "seconds");
+    if (seconds && !isSegmentMode(node)) {
+        const snapped = h3SnappedSeconds(seconds.value);
+        if (Number.isFinite(snapped) && snapped !== Number(seconds.value)) {
+            seconds.value = snapped;
+            if (seconds._state) seconds._state.value = snapped;
+        }
+        syncSecondsWidgetLabel(node);
+    }
+    if (isSegmentMode(node)) {
+        const segmentSeconds = getWidget(node, "segment_seconds");
+        if (segmentSeconds) {
+            const snapped = h3SnapSegmentSecondsSpec(String(segmentSeconds.value || ""));
+            if (snapped != null) {
+                segmentSeconds.value = snapped;
+                if (segmentSeconds._state) segmentSeconds._state.value = snapped;
+            }
+        }
+        syncSegmentSummary(node);
+    }
+}
+
 function syncSegmentSummary(node) {
     if (!isSegmentMode(node)) return false;
     const localSecondsSpec = String(getWidgetValue(node, "segment_seconds", "") || "");
@@ -4888,12 +4978,44 @@ function syncSegmentSummary(node) {
     // (for example a pass-through Set/Get node), keep the existing summary
     // instead of replacing it with the stale local fallback.
     const canSyncFromLinkedSpec = segmentSecondsInput?.link == null || linkedSeconds.found;
+    // Snap per-segment durations onto the real 17k(+5) frame grid first, then
+    // derive the summary total from the snapped spec so it matches what the
+    // backend will actually render.
+    let effectiveSpec = secondsSpec;
+    if (segmentSeconds && segmentSecondsInput?.link == null && !node.__h3SegmentSecondsSnapping) {
+        const snapped = h3SnapSegmentSecondsSpec(localSecondsSpec);
+        if (snapped != null) {
+            node.__h3SegmentSecondsSnapping = true;
+            try {
+                segmentSeconds.value = snapped;
+                if (segmentSeconds._state) segmentSeconds._state.value = snapped;
+                effectiveSpec = snapped;
+            } finally {
+                node.__h3SegmentSecondsSnapping = false;
+            }
+        }
+    }
+    const effectiveParts = effectiveSpec.split(",").map((item) => item.trim()).filter(Boolean);
+    const total = effectiveParts.reduce((sum, item) => {
+        const value = Number.parseFloat(item);
+        return Number.isFinite(value) ? sum + value : sum;
+    }, 0);
+    const seconds = getWidget(node, "seconds");
+    const totalSecondsInput = node?.inputs?.find((input) => String(input?.name || "") === "seconds");
     if (seconds && total > 0 && canSyncFromLinkedSpec && totalSecondsInput?.link == null) {
-        seconds.value = Math.round(total * 10) / 10;
+        seconds.value = Math.round(total * 1000) / 1000;
         if (seconds._state) seconds._state.value = seconds.value;
     }
     const segmentSeconds = getWidget(node, "segment_seconds");
-    if (segmentSeconds) segmentSeconds.label = TEXT.segmentSecondsHint && parts.length ? TEXT.segmentSeconds : TEXT.segmentSeconds;
+    if (segmentSeconds) {
+        const hintParts = effectiveSpec.split(",").map((item) => Number.parseFloat(item.trim())).filter((item) => Number.isFinite(item));
+        const hints = hintParts.map((value, index) => h3SecondsWidgetHint(value, index)).filter(Boolean);
+        if (hints.length) {
+            segmentSeconds.label = `${TEXT.segmentSeconds}（${hints.join(" | ")}）`;
+        } else {
+            segmentSeconds.label = TEXT.segmentSeconds;
+        }
+    }
     return true;
 }
 
@@ -7729,6 +7851,34 @@ function installNode(nodeType, nodeData) {
                 this.setDirtyCanvas?.(true, true);
             };
         }
+        const secondsWidget = getWidget(this, "seconds");
+        if (secondsWidget && !secondsWidget.__h3SecondsSnapBound) {
+            secondsWidget.__h3SecondsSnapBound = true;
+            // The backend quantizes durations to a 17k(+5) frame grid at
+            // 24 FPS, so a 1-decimal step can never express the real length.
+            // Allow 3 decimals and snap the stored value onto the grid.
+            secondsWidget.options ||= {};
+            secondsWidget.options.step = 0.001;
+            secondsWidget.options.precision = 3;
+            const originalSecondsCallback = secondsWidget.callback;
+            secondsWidget.callback = (value) => {
+                originalSecondsCallback?.call(secondsWidget, value);
+                if (secondsWidget.__h3SecondsSnapping) return;
+                secondsWidget.__h3SecondsSnapping = true;
+                try {
+                    const snapped = h3SnappedSeconds(value);
+                    if (Number.isFinite(snapped) && snapped !== Number(value)) {
+                        secondsWidget.value = snapped;
+                        if (secondsWidget._state) secondsWidget._state.value = snapped;
+                    }
+                    syncSecondsWidgetLabel(this);
+                } finally {
+                    secondsWidget.__h3SecondsSnapping = false;
+                }
+                repairNodeLayout(this);
+            };
+            syncSecondsWidgetLabel(this);
+        }
         return result;
     };
 
@@ -7759,6 +7909,9 @@ function installNode(nodeType, nodeData) {
         // previously stable size is already authoritative, so reapplying the
         // same widget visibility must not add/subtract rows again.
         syncModeWidgets(this, { adjustHeight: false });
+        // localizeNodeInstance resets the seconds label; re-apply the
+        // frame-grid hint so it survives tab switches.
+        syncSecondsWidgetLabel(this);
         repairNodeLayout(this);
         return result;
     };
@@ -7806,6 +7959,7 @@ function installNode(nodeType, nodeData) {
         }
         migrateLegacyPromptSlots(this);
         repairConfiguredWidgetValues(this, info);
+        snapSecondsWidgetsOnConfigure(this);
         normalizeLinks(this);
         pruneTransportInputsFromNode(this, { force: true });
         normalizeLinks(this);
